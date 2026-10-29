@@ -1,0 +1,217 @@
+name: release
+
+# Component-level release for veriforge: the CLI binary + OVMF.fd.
+#
+# The product-level release (initrd.img / vmlinuz / four artifacts + chain.json
+# + a single provenance) lives in verirelay/release, which is the authoritative
+# record of the SEV-SNP measurement chain. This one serves people who use
+# veriforge and the firmware directly; the two are independent (verirelay/release
+# checks out the pinned commit and rebuilds in place; it does not consume this release).
+#
+# The CLI binary keeps VCS information (-buildvcs=false is not passed): it is
+# deterministic for the same commit + toolchain, and `go version -m veriforge`
+# shows the commit directly, which is more useful for a tool than embedding
+# nothing at all.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag to use, e.g. v0.1.0
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      # Note: the runner context cannot be used in job-level env; OUT is written to $GITHUB_ENV in the first step.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: resolve source identity
+        id: source
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          dirty="$(git status --porcelain)"
+          if [[ -n "$dirty" ]]; then
+            echo "error: releases must build on a clean worktree; uncommitted changes:" >&2
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "commit: $commit"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.10'
+          cache: true
+
+      - name: build veriforge cli
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          # The toolchain is defined once here and exported for the report step:
+          # the component build report must record the toolchain that actually built the
+          # artifacts, not whatever go the host happens to have.
+          gotoolchain="go1.26.10"
+          echo "TOOLCHAIN=$(env GOTOOLCHAIN="$gotoolchain" go version | awk '{print $3}')" >> "$GITHUB_ENV"
+          env GOENV=off GOFLAGS='' GOEXPERIMENT='' \
+              CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN="$gotoolchain" \
+            go build -trimpath -mod=readonly -o "$OUT/veriforge-linux-amd64" ./cmd/veriforge
+          file "$OUT/veriforge-linux-amd64"
+          "$OUT/veriforge-linux-amd64" -h 2>&1 | head -3 || true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: build OVMF.fd
+        run: |
+          set -euo pipefail
+          # ovmf/build.sh clones edk2 submodules with git submodule update, and
+          # git retries only once, so a flaky network fails outright. Retrying
+          # lives in the orchestration layer and changes neither the source tree
+          # nor the artifact bytes; the digest assertion is never retried.
+          for attempt in 1 2 3; do
+            echo "--- docker buildx attempt $attempt/3 ---"
+            if docker buildx build \
+                 --platform linux/amd64 \
+                 --target export \
+                 --output "type=local,dest=$OUT" \
+                 --cache-from type=gha \
+                 --cache-to type=gha,mode=max \
+                 -f ovmf/Dockerfile . ; then
+              break
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "error: OVMF build failed 3 times in a row" >&2
+              exit 1
+            fi
+            echo "warning: attempt $attempt failed (usually submodule clone flakiness); retrying in 15s" >&2
+            sleep 15
+          done
+
+      - name: verify firmware against audit baseline
+        run: |
+          set -euo pipefail
+          ( cd "$OUT" && sha256sum -c OVMF.fd.sha256 )
+          diff -u ovmf/artifacts.lock "$OUT/artifacts.lock"
+
+      - name: reproducibility check (cold rebuild)
+        run: |
+          set -euo pipefail
+          cold_dir="$RUNNER_TEMP/ovmf-cold"
+          mkdir -p "$cold_dir"
+          docker buildx build \
+            --platform linux/amd64 \
+            --no-cache \
+            --target export \
+            --output "type=local,dest=$cold_dir" \
+            -f ovmf/Dockerfile .
+          warm="$(sha256sum "$OUT/OVMF.fd" | cut -d' ' -f1)"
+          cold="$(sha256sum "$cold_dir/OVMF.fd" | cut -d' ' -f1)"
+          [[ "$warm" == "$cold" ]] || { echo "error: OVMF builds differ" >&2; exit 1; }
+          cmp "$OUT/OVMF.fd" "$cold_dir/OVMF.fd"
+          diff -u "$OUT/artifacts.lock" "$cold_dir/artifacts.lock"
+          echo "reproducible OVMF.fd SHA-256: $warm"
+
+      - name: write checksums and component build report
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          sha256sum veriforge-linux-amd64 OVMF.fd OVMF.fd.sha256 artifacts.lock > SHA256SUMS
+
+          # Note: this step already cd'd into $OUT, so repo files must be read via absolute paths.
+          edk2="$(sed -nE 's/^commit = "([0-9a-f]{40})"/\1/p' "$GITHUB_WORKSPACE/ovmf/source.lock" | head -1)"
+          patch="$(sed -nE 's/^sha256 = "([0-9a-f]{64})"/\1/p' "$GITHUB_WORKSPACE/ovmf/source.lock" | head -1)"
+
+          jq -n \
+            --arg commit "${{ steps.source.outputs.commit }}" \
+            --arg tag "$RELEASE_TAG" \
+            --arg go "$TOOLCHAIN" \
+            --arg bin "$(sha256sum veriforge-linux-amd64 | cut -d' ' -f1)" \
+            --arg bin_size "$(stat -c %s veriforge-linux-amd64)" \
+            --arg ovmf "$(sha256sum OVMF.fd | cut -d' ' -f1)" \
+            --arg ovmf_size "$(stat -c %s OVMF.fd)" \
+            --arg edk2 "$edk2" \
+            --arg patch "$patch" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              version: "verirelay-component-build/1",
+              component: "veriforge",
+              repository: "https://github.com/verirelay/veriforge",
+              commit: $commit,
+              release_tag: $tag,
+              artifacts: {
+                "veriforge-linux-amd64": { sha256: $bin, size: ($bin_size | tonumber) },
+                "OVMF.fd": { sha256: $ovmf, size: ($ovmf_size | tonumber) }
+              },
+              ovmf_source: { edk2_commit: $edk2, patch_sha256: $patch },
+              toolchain: { go_version: $go },
+              build: { runner: "ubuntu-24.04", workflow_run: $run_url }
+            }' > veriforge-component-build.json
+
+          sha256sum veriforge-component-build.json >> SHA256SUMS
+          cat SHA256SUMS
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # cosign-installer has no v4 floating tag, so it must be pinned to an exact version
+          cosign-release: 'v3.1.4'
+
+      - name: sign artifacts (keyless)
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          for f in veriforge-linux-amd64 OVMF.fd artifacts.lock SHA256SUMS veriforge-component-build.json; do
+            echo "--- signing $f ---"
+            cosign sign-blob --yes --bundle "$f.cosign.bundle" "$f"
+          done
+          ls -l ./*.cosign.bundle
+
+      # $OUT holds exactly the release assets published below.
+      - name: attest provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ runner.temp }}/out/*
+
+      # Archive before publishing: if the release step fails, the evidence is still preserved.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-veriforge-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            "$OUT"/veriforge-linux-amd64 \
+            "$OUT"/OVMF.fd \
+            "$OUT"/OVMF.fd.sha256 \
+            "$OUT"/artifacts.lock \
+            "$OUT"/SHA256SUMS \
+            "$OUT"/veriforge-component-build.json \
+            "$OUT"/*.cosign.bundle

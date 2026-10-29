@@ -1,0 +1,30 @@
+From 908a73e7bc8db0980e3963b63bb82a8a56372e7d Mon Sep 17 00:00:00 2001
+From: Veriforge <noreply@example.invalid>
+Date: Mon, 20 Jul 2026 00:00:00 +0000
+Subject: [PATCH] OvmfPkg/AmdSev: use generic Linux GRUB modules
+
+Use the generic `linux` module in place of `linuxefi` and omit the
+SEV-secret GRUB module.  The locked edk2 revision does not contain an
+`initrdefi` module entry, so the requested `initrdefi` to `initrd`
+replacement is intentionally a no-op for this source version.
+
+---
+ OvmfPkg/AmdSev/Grub/grub.sh | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/OvmfPkg/AmdSev/Grub/grub.sh b/OvmfPkg/AmdSev/Grub/grub.sh
+--- a/OvmfPkg/AmdSev/Grub/grub.sh
++++ b/OvmfPkg/AmdSev/Grub/grub.sh
+@@ -42,9 +42,8 @@ GRUB_MODULES="
+             test
+             regexp
+             linux
+-            linuxefi
++            linux
+             reboot
+-            sevsecret
+             "
+ basedir=$(dirname -- "$0")
+
+--
+2.43.0

@@ -1,0 +1,10 @@
+version = 2
+
+[source]
+name = "edk2"
+repository = "https://github.com/tianocore/edk2.git"
+commit = "2970e5699ba6267f3384ffab20f96647578aebc8"
+
+[[patches]]
+path = "patches/amd-sev-grub.patch"
+sha256 = "179e74746315bf3dc751d09bba709d511684dab4629489bc02e6feb0d074ab93"

@@ -1,0 +1,103 @@
+name: ovmf
+
+# Builds the AMD SEV/SNP firmware only. All inputs are locked inside ovmf/:
+#   Dockerfile (base image digest + APT snapshot + top-level package versions)
+#   source.lock (edk2 commit + patch sha256)
+#   artifacts.lock (full dpkg closure baseline)
+# This pipeline needs no external input and is independent of the runner environment.
+
+on:
+  push:
+    # Only the integration branch main: a tag push has no new commit and paths
+    # matching is meaningless, yet it would trigger a ten-minute firmware build.
+    # Feature branches are covered by pull_request.
+    branches: [main]
+    paths:
+      - 'ovmf/**'
+      - '.github/workflows/ovmf.yml'
+  pull_request:
+    paths:
+      - 'ovmf/**'
+      - '.github/workflows/ovmf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Group by branch name, not github.ref: push and pull_request carry
+  # different refs, so the same push would otherwise run twice.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: build OVMF.fd
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # ovmf/build.sh clones edk2 submodules with git submodule update, and
+          # git retries only once, so a flaky network fails outright. Retrying
+          # lives in the orchestration layer and changes neither the source tree
+          # nor the artifact bytes; the digest assertion is never retried.
+          for attempt in 1 2 3; do
+            echo "--- docker buildx attempt $attempt/3 ---"
+            if docker buildx build \
+                 --platform linux/amd64 \
+                 --target export \
+                 --output type=local,dest=dist \
+                 --cache-from type=gha \
+                 --cache-to type=gha,mode=max \
+                 -f ovmf/Dockerfile . ; then
+              break
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "error: OVMF build failed 3 times in a row" >&2
+              exit 1
+            fi
+            echo "warning: attempt $attempt failed (usually submodule clone flakiness); retrying in 15s" >&2
+            sleep 15
+          done
+
+      - name: verify firmware against audit baseline
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c OVMF.fd.sha256
+          cd ..
+
+          # The apt/dpkg closure must match the repo baseline; a mismatch means the build environment drifted.
+          diff -u ovmf/artifacts.lock dist/artifacts.lock
+
+      - name: reproducibility check (cold rebuild)
+        run: |
+          set -euo pipefail
+          mkdir -p dist-cold
+          docker buildx build \
+            --platform linux/amd64 \
+            --no-cache \
+            --target export \
+            --output type=local,dest=dist-cold \
+            -f ovmf/Dockerfile .
+          warm="$(sha256sum dist/OVMF.fd | cut -d' ' -f1)"
+          cold="$(sha256sum dist-cold/OVMF.fd | cut -d' ' -f1)"
+          [[ "$warm" == "$cold" ]] || { echo "error: OVMF builds differ" >&2; exit 1; }
+          cmp dist/OVMF.fd dist-cold/OVMF.fd
+          diff -u dist/artifacts.lock dist-cold/artifacts.lock
+          echo "reproducible OVMF.fd SHA-256: $warm"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: OVMF-${{ github.sha }}
+          path: |
+            dist/OVMF.fd
+            dist/OVMF.fd.sha256
+            dist/artifacts.lock
+          if-no-files-found: error

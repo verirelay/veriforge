@@ -1,0 +1,43 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - errorlint
+    - gocyclo
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - noctx
+    - staticcheck
+    - unused
+  settings:
+    gocyclo:
+      min-complexity: 20
+    gosec:
+      excludes:
+        # File paths come from CLI flags.
+        - G304
+        # Build tool: subprocess args and paths come from CLI flags; file modes are
+        # part of the reproducible initrd output, so changing them changes the digest.
+        - G204
+        - G301
+        - G302
+        - G306
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt

@@ -1,0 +1,12 @@
+# The OVMF build context (docker buildx build -f ovmf/Dockerfile .) contains
+# source only: local hidden files and tool state, including .git, are excluded.
+.*
+
+# Local cache and build outputs are never build inputs.
+.veriforge_cache/
+dist/
+/veriforge
+initrd.img
+vmlinuz
+*.img
+tmp/

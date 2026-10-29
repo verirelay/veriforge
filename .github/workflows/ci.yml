@@ -1,0 +1,136 @@
+name: ci
+
+on:
+  # main is the integration branch: push only watches it, feature branches
+  # are covered by pull_request, so one push never triggers two runs.
+  # Tags are handled by release.yml.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_forge:
+        description: run a full initrd build with mock-init (downloads 181MB of kernel/modules debs; slow)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Group by branch name, not github.ref: push and pull_request carry
+  # different refs, so the same push would otherwise run twice.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.10'
+          cache: true
+
+      - name: format
+        run: |
+          set -euo pipefail
+          unformatted="$(go run mvdan.cc/gofumpt@v0.12.0 -l .)"
+          [[ -z "$unformatted" ]] || { echo "error: unformatted files:" >&2; printf '%s\n' "$unformatted" >&2; exit 1; }
+
+      - name: vet
+        run: go vet ./...
+
+      # The version must match version: "2" in .golangci.yml.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.15.0
+
+      - name: test
+        run: go test ./...
+
+      - name: build
+        run: |
+          make build
+          make mock-init
+
+      # Build outputs must be covered by .gitignore: unignored files would make
+      # build-report.json record dirty=true.
+      - name: assert clean worktree after build
+        run: |
+          set -euo pipefail
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "error: worktree is not clean after the build; these files are not covered by .gitignore:" >&2
+            printf '%s\n' "$status" >&2
+            exit 1
+          fi
+
+      # YAML parsing alone cannot catch workflow mistakes; only actionlint does.
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -version
+          "$(go env GOPATH)/bin/actionlint"
+
+  # Optional full-build smoke test: it uses mock-init instead of a real
+  # VeriRelay binary and every artifact carries a smoke- prefix; never publish them.
+  smoke-forge:
+    if: inputs.full_forge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.10'
+          cache: true
+
+      - name: build cli and mock init
+        run: |
+          make build
+          make mock-init
+
+      # kernel/modules deb cache. The key binds the two hashes in defaults.go,
+      # so a kernel version bump invalidates it automatically.
+      - name: resolve kernel cache key
+        id: kernel
+        run: |
+          set -euo pipefail
+          kernel="$(grep -oE 'KernelHash:\s+"[0-9a-f]{64}"' internal/config/defaults.go | grep -oE '[0-9a-f]{64}')"
+          modules="$(grep -oE 'ModulesHash:\s+"[0-9a-f]{64}"' internal/config/defaults.go | grep -oE '[0-9a-f]{64}')"
+          [[ -n "$kernel" && -n "$modules" ]] || { echo "error: could not parse kernel/modules hash from defaults.go" >&2; exit 1; }
+          echo "key=kernel-debs-${kernel:0:16}-${modules:0:16}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/veriforge-cache
+          key: ${{ steps.kernel.outputs.key }}
+
+      - name: forge initrd with mock init
+        run: |
+          set -euo pipefail
+          # Smoke only: mock-init is not VeriRelay, so the verirelay commit
+          # declared here is unrelated to the binary. Artifacts carry a smoke-
+          # prefix and must not be published.
+          scripts/forge-initrd.sh \
+            --init dist/mock-init \
+            --verirelay-commit 0000000000000000000000000000000000000000 \
+            --verirelay-repository https://github.com/verirelay/verirelay \
+            --kernel-append "console=ttyS0 quiet panic=1" \
+            --out-dir "$RUNNER_TEMP/smoke-out" \
+            --cache "${{ runner.temp }}/veriforge-cache"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-initrd-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/smoke-out/initrd.img
+            ${{ runner.temp }}/smoke-out/vmlinuz
+            ${{ runner.temp }}/smoke-out/build-report.json
+          if-no-files-found: error
